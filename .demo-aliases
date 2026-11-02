@@ -1,0 +1,63 @@
+# PetClinic dev-story demo aliases.
+#
+# Source this file from your zsh session to get four helpers wired up:
+#
+#   source /Users/darylsmi/workspace/petclinic-demo/.demo-aliases
+#
+# Then, in one demo session:
+#   1. edit a file locally
+#   2. git commit -am 'change the messaging' && git push
+#   3. demo-watch      # (Ctrl-C when SUCCEEDED=True on the newest row)
+#   4. demo-roll       # rolls the Deployment to the fresh image + waits
+#   5. refresh https://spring-petclinic.palettex.dev/
+#
+# Or one-shot: `demo-deploy` blocks until kpack builds a fresh image (waits
+# for the digest to change from what's built right now), then rolls automatically.
+
+# Watch kpack builds tail as they progress. Ctrl-C to exit.
+alias demo-watch='kubectl --context paihub -n spring-demo get build -w'
+
+# One-shot list of recent builds (no follow — for reading status at a glance).
+alias demo-builds='kubectl --context paihub -n spring-demo get builds --sort-by=.metadata.creationTimestamp | tail -8'
+
+# Set the running Deployment's image to whatever kpack has most recently produced.
+# Assumes a fresh build has already completed (use `demo-watch` or `demo-builds` first).
+alias demo-roll='_NEW=$(kubectl --context paihub -n spring-demo get image spring-petclinic -o jsonpath="{.status.latestImage}"); \
+  echo "rolling to: $_NEW"; \
+  kubectl --context paihub -n spring-demo set image deploy/spring-petclinic app="$_NEW" && \
+  kubectl --context paihub -n spring-demo rollout status deploy/spring-petclinic --timeout=90s'
+
+# Show the current URL + which image the Pod is running (sanity check before/after).
+alias demo-status='echo "URL:      https://spring-petclinic.palettex.dev/"; \
+  echo -n "built:    "; kubectl --context paihub -n spring-demo get image spring-petclinic -o jsonpath="{.status.latestImage}"; echo; \
+  echo -n "deployed: "; kubectl --context paihub -n spring-demo get deploy spring-petclinic -o jsonpath="{.spec.template.spec.containers[0].image}"; echo; \
+  echo -n "commit:   "; kubectl --context paihub -n spring-demo get build --sort-by=.metadata.creationTimestamp -o jsonpath="{.items[-1:].spec.source.git.revision}"; echo'
+
+# Full loop: wait for a NEW image (different digest from now), then roll + await.
+# Use after `git push`, and it'll auto-roll the Deployment as soon as kpack finishes.
+demo-deploy() {
+  local BEFORE CUR
+  BEFORE=$(kubectl --context paihub -n spring-demo get image spring-petclinic -o jsonpath='{.status.latestImage}')
+  echo "waiting for kpack — current baseline: ${BEFORE##*@}"
+  local i=0
+  while true; do
+    CUR=$(kubectl --context paihub -n spring-demo get image spring-petclinic -o jsonpath='{.status.latestImage}' 2>/dev/null)
+    if [[ -n "$CUR" && "$CUR" != "$BEFORE" ]]; then
+      echo "new image after ${i}s: ${CUR##*@}"
+      break
+    fi
+    # Show the newest build's phase every 15s so you know it's alive.
+    if (( i > 0 && i % 15 == 0 )); then
+      kubectl --context paihub -n spring-demo get builds --sort-by=.metadata.creationTimestamp -o custom-columns=NAME:.metadata.name,SUCCEEDED:.status.conditions[0].status --no-headers | tail -1
+    fi
+    sleep 5
+    (( i += 5 ))
+    if (( i > 600 )); then
+      echo "timed out after 10 minutes — check demo-builds for the stuck build"
+      return 1
+    fi
+  done
+  kubectl --context paihub -n spring-demo set image deploy/spring-petclinic app="$CUR"
+  kubectl --context paihub -n spring-demo rollout status deploy/spring-petclinic --timeout=90s
+  echo "done — refresh https://spring-petclinic.palettex.dev/"
+}
